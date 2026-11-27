@@ -1,17 +1,19 @@
 # backend/api/routers/cards.py
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from pathlib import Path
 from collections import Counter
+from typing import Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 from sqlalchemy.orm import Session
 
 from backend.db.deps import get_db
 from backend.schemas.card import CardPublic
-from backend.services import card_service, vault_service
+from backend.services import card_service, search_service, vault_service
 
 # Tagging tools
 from backend.api.tools.gemini_image_tags import get_tags_for_image_file
@@ -22,9 +24,12 @@ from backend.api.tools.tag_normalizer import normalize_and_alias
 from backend.api.tools.tag_similarity import CategoryIndex
 from backend.api.tools.tag_resolver import resolve_tags
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["cards"])
 
-MEDIA_DIR = Path("backend/media")
+# Where uploads are stored (and served from, see main.py). Overridable, e.g. for the eval vault.
+MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "backend/media"))
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 ALLOWED_VIDEO_TYPES = {"video/mp4", "video/webm", "video/quicktime"}
@@ -165,6 +170,81 @@ def get_top_tags(vault_id: str, limit: int = 7, db: Session = Depends(get_db)):
     return top_tags
 
 
+def _index_for_search(db: Session, card) -> None:
+    """Embed a new card for search. Failure is logged, not fatal: search re-indexes lazily."""
+    try:
+        search_service.index_card(db, card)
+    except Exception:
+        db.rollback()
+        logger.exception("[search] could not index card %s", card.id)
+
+
+@router.get("/vaults/{vault_id}/search")
+def search_vault(
+    vault_id: str,
+    response: Response,
+    q: str,
+    limit: int = 5,
+    mode: Literal["semantic", "keyword"] = "semantic",
+    db: Session = Depends(get_db),
+):
+    """semantic (default): max cosine similarity between the query and each card's caption/tags.
+    keyword: exact normalized-tag or caption match, kept as a baseline for comparison."""
+    vault = vault_service.get_vault(db, vault_id)
+    if not vault:
+        raise HTTPException(status_code=404, detail="Vault not found")
+    q = q.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Empty query")
+    limit = max(1, min(limit, 50))
+
+    if mode == "keyword":
+        result = search_service.keyword_search_vault(db, vault_id, q, limit=limit)
+    else:
+        result = search_service.search_vault(db, vault_id, q, limit=limit)
+    response.headers["Server-Timing"] = ", ".join(
+        f"{k.removesuffix('_ms')};dur={v}" for k, v in result.timings_ms.items()
+    )
+    return {
+        "query": q,
+        "mode": mode,
+        "results": [
+            {
+                **card_service.to_public_dict(h.card),
+                "score": round(h.score, 4),
+                "matched": {"kind": h.matched_kind, "text": h.matched_text},
+            }
+            for h in result.hits
+        ],
+        "timings_ms": result.timings_ms,
+        "cards_indexed": result.cards_indexed,
+    }
+
+
+@router.delete("/cards/{card_id}")
+def delete_card(card_id: str, db: Session = Depends(get_db)):
+    """Deletes a card. The media file is removed only if no other card still uses it."""
+    card = card_service.delete_card(db, card_id)
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+    search_service.delete_card_embeddings(db, card_id)
+
+    removed_files: list[str] = []
+    for name in {card.media_id, card.thumbnail_id} - {None}:
+        if card_service.media_in_use(db, name):
+            continue
+        path = MEDIA_DIR / name
+        try:
+            path.unlink()
+            removed_files.append(name)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("[cards] could not delete media file %s", path)
+
+    return {"ok": True, "cardId": card_id, "removed_files": removed_files}
+
+
 @router.post("/vaults/{vault_id}/cards", response_model=CardPublic)
 async def create_card(
     vault_id: str,
@@ -211,10 +291,16 @@ async def create_card(
             hashtags = result.get("hashtags") or []
             generated_tags = [str(h).lstrip("#").strip() for h in hashtags if str(h).strip()]
             print(f"[tagging] video hashtags for {media_id}:", generated_tags)
-    except Exception as e:
-        # Don't crash upload for demo
-        print("[tagging] failed:", repr(e))
+    except Exception:
+        # Don't crash the upload, but record the real cause with a full traceback.
+        logger.exception(
+            "[tagging] %s tagging failed for %s (file=%s); saving card without AI tags",
+            detected_kind, media_id, file.filename,
+        )
         generated_tags = []
+    else:
+        if not generated_tags:
+            logger.warning("[tagging] %s tagging returned 0 tags for %s", detected_kind, media_id)
 
     user_tags = _parse_user_tags(tags)
 
@@ -232,7 +318,9 @@ async def create_card(
             caption=caption,
             tags=[],
             is_active=isActive,
+            raw_tags=generated_tags,
         )
+        _index_for_search(db, card)
         return card_service.to_public_dict(card)
 
     # ---------------------------------------------
@@ -247,10 +335,16 @@ async def create_card(
     # ---------------------------------------------
     # 3) Resolve tags (normalize + match/new/ambig)
     # ---------------------------------------------
-    resolved = resolve_tags(raw_tags, index, top_k=3, learn_new=True)
+    # keep_ambiguous / merge_within_batch=False were chosen by
+    # backend/benchmarks/tag_pipeline_eval.py (see LEARNING.md): dropping ambiguous
+    # tags lost 10/50 useful tags, and merging into a tag learned from the same
+    # image produced the one bad merge (sunset -> sunrise).
+    resolved = resolve_tags(
+        raw_tags, index, top_k=3, learn_new=True,
+        keep_ambiguous=True, merge_within_batch=False,
+    )
 
-    # Store ONLY match/new.
-    # Ambiguous are NOT stored, but we log them so you can see what's being skipped.
+    # Store match/new (with keep_ambiguous, nothing is left ambiguous).
     final_tags: list[str] = []
     ambiguous_skipped: list[str] = []
 
@@ -287,6 +381,8 @@ async def create_card(
         caption=caption,
         tags=final_tags,
         is_active=isActive,
+        raw_tags=generated_tags,
     )
 
+    _index_for_search(db, card)
     return card_service.to_public_dict(card)

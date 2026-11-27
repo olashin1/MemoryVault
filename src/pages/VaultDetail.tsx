@@ -9,6 +9,7 @@ import VaultAddMediaSection from "../components/vault/VaultAddMediaSection";
 import { Card } from "../components/memorypage/Card";
 import type { CardPublic } from "../types/card";
 import CategoryLine from "../components/CategoryLine";
+import VaultSearch from "../components/vault/VaultSearch";
 import "../styles/VaultDetail.css";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
@@ -198,7 +199,14 @@ export default function VaultDetailPage() {
     const map = new Map<string, CardPublic[]>();
 
     for (const card of vaultCards) {
-      const tags = Array.isArray((card as any).tags) ? (card as any).tags : [];
+      // Group by the backend's normalize_and_alias output (the same key /top-tags
+      // uses), so stored variants like "clouds"/"Cloud" land in the "cloud" row.
+      const normalized = (card as any).normalized_tags;
+      const tags = Array.isArray(normalized)
+        ? normalized
+        : Array.isArray((card as any).tags)
+          ? (card as any).tags
+          : [];
       for (const t of tags) {
         const tag = String(t).trim().toLowerCase();
         if (!tag) continue;
@@ -296,6 +304,8 @@ export default function VaultDetailPage() {
             <h1>{vault.title}</h1>
             <p>{vault.description}</p>
           </div>
+
+          <VaultSearch vaultId={vaultId} apiBaseUrl={API_URL} />
 
           {items.length > 0 && (
             <div className="vault-detail-media">

@@ -1,5 +1,6 @@
 # backend/main.py
 from pathlib import Path
+import logging
 import os
 from dotenv import load_dotenv
 
@@ -30,6 +31,12 @@ async def lifespan(app: FastAPI):
     init_db()
     connect_db()
     seed_demo_data()
+    # Load the local embedding model now so the first search/upload doesn't pay for it.
+    try:
+        from backend.api.tools.tag_similarity import _get_embedder
+        _get_embedder()
+    except Exception:
+        logging.getLogger(__name__).exception("[startup] embedding model failed to load")
     yield
     disconnect_db()
 
@@ -62,4 +69,7 @@ def health():
 app.include_router(health_router, prefix="/api")
 app.include_router(api_router, prefix="/api")
 
-app.mount("/media", StaticFiles(directory="backend/media"), name="media")
+from backend.api.routers.cards import MEDIA_DIR  # noqa: E402
+
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")

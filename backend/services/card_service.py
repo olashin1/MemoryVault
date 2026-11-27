@@ -1,5 +1,18 @@
+import json
+
 from sqlalchemy.orm import Session
+from backend.api.tools.tag_normalizer import normalize_and_alias
 from backend.models.card import Card
+
+
+def normalized_tags(tags: list[str]) -> list[str]:
+    """Same normalization /top-tags uses, so the UI can group cards by the same key."""
+    out: list[str] = []
+    for t in tags:
+        n = normalize_and_alias(t)
+        if n and n not in out:
+            out.append(n)
+    return out
 
 def _serialize_tags(tags: list[str]) -> str:
     return ",".join([t.strip() for t in tags if t.strip()])
@@ -18,6 +31,7 @@ def create_card(
     caption: str,
     tags: list[str],
     is_active: bool,
+    raw_tags: list[str] | None = None,
 ) -> Card:
     c = Card(
         vault_id=vault_id,
@@ -26,6 +40,7 @@ def create_card(
         media_type=media_type,
         caption=caption,
         tags=_serialize_tags(tags),
+        raw_tags=json.dumps(raw_tags or []),
         is_active=is_active,
     )
     db.add(c)
@@ -36,11 +51,21 @@ def create_card(
 def list_cards(db: Session, vault_id: str) -> list[Card]:
     return db.query(Card).filter(Card.vault_id == vault_id).order_by(Card.created_at.desc()).all()
 
-def delete_card(db: Session, card_id: str) -> None:
-    card = db.query(Card).filter(Card.id == card_id).first()
+def get_card(db: Session, card_id: str) -> Card | None:
+    return db.query(Card).filter(Card.id == card_id).first()
+
+
+def delete_card(db: Session, card_id: str) -> Card | None:
+    """Deletes the card and returns it (detached), or None if it did not exist."""
+    card = get_card(db, card_id)
     if card:
         db.delete(card)
         db.commit()
+    return card
+
+
+def media_in_use(db: Session, media_id: str) -> bool:
+    return db.query(Card.id).filter(Card.media_id == media_id).first() is not None
 
 def to_public_dict(card: Card) -> dict:
     return {
@@ -50,5 +75,6 @@ def to_public_dict(card: Card) -> dict:
         "media_type": card.media_type,
         "caption": card.caption,
         "tags": _parse_tags(card.tags),
+        "normalized_tags": normalized_tags(_parse_tags(card.tags)),
         "isActive": card.is_active,
     }
